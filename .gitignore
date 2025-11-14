@@ -1,0 +1,20 @@
+# Bỏ qua thư mục chứa các thư viện đã cài đặt
+node_modules/
+
+# File chứa key bí mật của Firebase Admin
+# ĐÂY LÀ FILE QUAN TRỌNG NHẤT CẦN BỎ QUA
+service-account.json
+
+# File môi trường (nếu sau này bạn dùng)
+.env
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Các file do hệ điều hành tạo ra
+.DS_Store
+Thumbs.db
