@@ -1,8 +1,12 @@
 {
+  "name": "backend_server",
+  "version": "1.0.0",
+  "description": "Node.js Backend for Flutter App",
+  "main": "server.js",
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "firebase-admin": "^13.6.0",
-    "openai": "^6.9.0"
+    "@google/generative-ai": "latest"
   }
 }
