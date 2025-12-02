@@ -4,9 +4,10 @@
   "description": "Node.js Backend for Flutter App",
   "main": "server.js",
   "dependencies": {
+    "@google/generative-ai": "latest",
+    "axios": "^1.13.2",
     "cors": "^2.8.5",
     "express": "^5.1.0",
-    "firebase-admin": "^13.6.0",
-    "@google/generative-ai": "latest"
+    "firebase-admin": "^13.6.0"
   }
 }

@@ -13,6 +13,8 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
+const axios = require('axios'); // <-- Thêm dòng này
+
 // --- CẤU HÌNH AI ---
 // Quan trọng: Hãy đảm bảo bạn đã dán Key mới tạo vào đây
 const genAI = new GoogleGenerativeAI("YOUR_GEMINI_API_KEY"); 
@@ -258,7 +260,51 @@ app.get('/api/quizzes', checkAuth, async (req, res) => {
     res.status(500).send('Error getting quizzes');
   }
 });
+// ============================================================
+// [TÍNH NĂNG] CHAT BOT AI (GỌI SANG PYTHON SERVER)
+// ============================================================
 
+// Cấu hình Link Ngrok của máy Python (Thay đổi mỗi lần chạy Ngrok)
+// Đây là link bạn copy từ màn hình đen của Ngrok bên máy Python
+const PYTHON_AI_URL = "https://xxxx-xxxx-xxxx.ngrok-free.app"; 
+
+app.post('/api/chat-tutor', checkAuth, async (req, res) => {
+  try {
+    const { question } = req.body;
+    
+    if (!question) {
+      return res.status(400).send("Vui lòng nhập câu hỏi.");
+    }
+
+    console.log(`[NodeJS] Đang chuyển câu hỏi sang Python: "${question}"`);
+
+    // --- GỌI SANG SERVER PYTHON (Qua Ngrok) ---
+    const response = await axios.post(`${PYTHON_AI_URL}/api/chat`, {
+      question: question,
+      subject: "General"
+    });
+
+    // Nhận dữ liệu từ Python: { answer: "...", sources: [...] }
+    const aiData = response.data;
+
+    // Trả về cho App Flutter
+    res.json({
+      success: true,
+      data: aiData
+    });
+
+  } catch (error) {
+    console.error("Lỗi kết nối Python AI:", error.message);
+    
+    // Xử lý lỗi nếu server Python chưa bật hoặc Ngrok sai link
+    if (error.code === 'ECONNREFUSED' || error.response?.status === 404) {
+      return res.status(503).send("Gia sư AI đang ngủ (Server Python chưa bật).");
+    }
+    
+    res.status(500).send("Lỗi hệ thống AI.");
+  }
+});
+// ============================================================
 // --- KHỞI ĐỘNG SERVER ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
