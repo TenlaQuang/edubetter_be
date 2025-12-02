@@ -2,12 +2,9 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
-const { OpenAI } = require('openai');
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // --- CÀI ĐẶT ---
-
-// 1. Cài đặt Firebase Admin
-// Bạn cần tải file serviceAccountKey.json từ Console Firebase
 const serviceAccount = require('./service-account.json');
 
 admin.initializeApp({
@@ -16,274 +13,254 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// 2. Cài đặt AI (Ví dụ: OpenAI)
-// Lấy API key từ tài khoản OpenAI của bạn
-const openai = new OpenAI({
-  apiKey: 'YOUR_OPENAI_API_KEY' // <-- THAY KEY CỦA BẠN VÀO ĐÂY
+// --- CẤU HÌNH AI ---
+// Quan trọng: Hãy đảm bảo bạn đã dán Key mới tạo vào đây
+const genAI = new GoogleGenerativeAI("YOUR_GEMINI_API_KEY"); 
+
+// Sử dụng model cơ bản để đảm bảo tương thích tối đa
+const model = genAI.getGenerativeModel({ 
+  model: "gemini-1.5-flash", 
 });
 
-// 3. Cài đặt Express
 const app = express();
-app.use(cors()); // Cho phép Flutter gọi API
-app.use(express.json()); // Đọc JSON từ body của request
+app.use(cors());
+// Tăng giới hạn body để nhận được nội dung bài học dài (nếu cần)
+app.use(express.json({ limit: '10mb' })); 
 
-// --- MIDDLEWARE XÁC THỰC ---
-// Middleware này sẽ kiểm tra Firebase ID Token do client (Flutter) gửi lên
+// --- MIDDLEWARE AUTH ---
 const checkAuth = async (req, res, next) => {
   const idToken = req.header('Authorization')?.replace('Bearer ', '');
-
-  if (!idToken) {
-    return res.status(401).send('Unauthorized: No token provided');
-  }
+  if (!idToken) return res.status(401).send('Unauthorized: No token provided');
 
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
-    // Gắn thông tin user (uid, email...) vào request để các hàm sau sử dụng
     req.user = decodedToken; 
     next();
   } catch (error) {
-    console.error('Error verifying token:', error);
+    console.error('Auth Error:', error);
     return res.status(403).send('Unauthorized: Invalid token');
   }
 };
 
 // --- ROUTES ---
 
-// === 1. AUTHENTICATION (Đăng ký / Đăng nhập) ===
-// Lưu ý: Với Firebase, Đăng ký/Đăng nhập thường diễn ra ở CLIENT (Flutter).
-// Client dùng Firebase SDK để đăng ký/đăng nhập (ví dụ: bằng Email/Pass, Google...).
-// Sau khi thành công, client lấy ID Token và gửi cho backend.
-// Backend chỉ cần MỘT endpoint để tạo profile user trong Firestore sau khi client đăng ký.
-
-/*
- * @route   POST /api/users/create-profile
- * @desc    Tạo profile user trong Firestore sau khi đăng ký thành công ở client
- * @access  Private (Phải có token)
- */
+// 1. Tạo Profile User
 app.post('/api/users/create-profile', checkAuth, async (req, res) => {
   try {
-    const { uid, email } = req.user; // Lấy từ middleware checkAuth
-    const { fullName, avatarUrl } = req.body; // Lấy thêm từ client
+    const { uid, email } = req.user;
+    const { fullName, avatarUrl } = req.body;
 
-    const userRef = db.collection('users').doc(uid);
-    await userRef.set({
-      uid: uid,
-      email: email,
+    await db.collection('users').doc(uid).set({
+      uid, email,
       fullName: fullName || '',
       avatarUrl: avatarUrl || '',
       createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+    }, { merge: true });
 
-    res.status(201).send({ message: 'User profile created', uid: uid });
+    res.status(201).send({ message: 'User profile created', uid });
   } catch (error) {
-    console.error('Error creating user profile:', error);
     res.status(500).send('Error creating user profile');
   }
 });
 
-// === 2. COURSE CONTENT (Nội dung khóa học) ===
-
-/*
- * @route   GET /api/courses
- * @desc    Lấy danh sách tất cả khóa học
- * @access  Private
- */
+// 2. Lấy danh sách Môn học (Subjects)
+// API này map dữ liệu từ bảng 'subjects' sang format Client cần
 app.get('/api/courses', checkAuth, async (req, res) => {
   try {
-    const coursesSnapshot = await db.collection('courses').get();
-    const courses = coursesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.status(200).json(courses);
+    const snapshot = await db.collection('subjects').get();
+    const subjects = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        name: data.name, 
+        title: data.name, // Fallback cho client cũ
+        description: data.description,
+        thumbnailUrl: data.thumbnailUrl
+      };
+    });
+    res.status(200).json(subjects);
   } catch (error) {
-    res.status(500).send('Error getting courses');
+    console.error(error);
+    res.status(500).send('Error getting subjects');
   }
 });
 
-/*
- * @route   GET /api/courses/:courseId/lessons
- * @desc    Lấy tất cả bài học (gồm URL video) của một khóa học
- * @access  Private
- */
-app.get('/api/courses/:courseId/lessons', checkAuth, async (req, res) => {
+// 3. Lấy bài học theo Môn học
+app.get('/api/courses/:subjectId/lessons', checkAuth, async (req, res) => {
   try {
-    const { courseId } = req.params;
-    const lessonsSnapshot = await db.collection('lessons')
-                                    .where('courseId', '==', courseId)
-                                    .orderBy('order') // Sắp xếp theo thứ tự bài học
-                                    .get();
+    const { subjectId } = req.params;
+    // Tìm các bài học có subjectId trùng khớp
+    const snapshot = await db.collection('lessons')
+                             .where('subjectId', '==', subjectId)
+                             .get();
+    
+    const lessons = snapshot.docs
+      .map(doc => ({ id: doc.id, ...doc.data() }))
+      .sort((a, b) => (a.orderIndex || 0) - (b.orderIndex || 0));
                                     
-    const lessons = lessonsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     res.status(200).json(lessons);
   } catch (error) {
+    console.error(error);
     res.status(500).send('Error getting lessons');
   }
 });
 
+// --- LOGIC TẠO QUIZ THÔNG MINH ---
 
-// === 3. QUIZ GENERATION (Tạo trắc nghiệm) ===
-
-/**
- * Hàm trợ giúp: Lấy nội dung text từ các bài học trong Firestore.
- * Giả sử trong document 'lessons' của bạn có một trường là 'textContent' hoặc 'transcript'.
- * Đây là phần text mà AI sẽ đọc để tạo câu hỏi.
- */
-const getLessonContentForAI = async (lessonIds) => {
+// Hàm helper: Lấy nội dung bài học từ Firestore
+const getLessonContent = async (lessonIds) => {
   let combinedContent = "";
   try {
-    const lessonPromises = lessonIds.map(id => db.collection('lessons').doc(id).get());
-    const lessonDocs = await Promise.all(lessonPromises);
+    const promises = lessonIds.map(id => db.collection('lessons').doc(id).get());
+    const docs = await Promise.all(promises);
 
-    for (const doc of lessonDocs) {
+    for (const doc of docs) {
       if (doc.exists) {
-        // GIẢ SỬ bạn lưu nội dung bài học trong trường 'textContent'
-        // Đây là điều KIÊN QUYẾT để AI có dữ liệu tạo câu hỏi
         const data = doc.data();
-        combinedContent += `--- Start Lesson ${data.title} ---\n`;
-        combinedContent += `${data.textContent}\n`; // <-- TRƯỜNG QUAN TRỌNG
-        combinedContent += `--- End Lesson ${data.title} ---\n\n`;
+        combinedContent += `--- BÀI HỌC: ${data.title} ---\n`;
+        
+        // Ưu tiên số 1: Nội dung văn bản (SGK)
+        if (data.textContent && data.textContent.trim().length > 0) {
+          combinedContent += data.textContent;
+        } 
+        // Ưu tiên số 2: Link Video (nếu không có text)
+        else if (data.videoUrl) {
+          combinedContent += `(Chỉ có video tham khảo: ${data.videoUrl})`;
+        }
+        combinedContent += `\n---------------------------\n`;
       }
     }
     return combinedContent;
   } catch (error) {
-    console.error("Error fetching lesson content:", error);
-    throw new Error("Failed to get lesson content");
+    throw new Error("Failed to get lesson content from DB");
   }
 };
 
-/**
- * Hàm trợ giúp: Gọi AI (OpenAI) để tạo trắc nghiệm từ nội dung text
- */
+// Hàm helper: Gọi Gemini API
 const generateQuizWithAI = async (content, numQuestions = 5) => {
   try {
-    // Đây là "Prompt" - câu lệnh bạn ra cho AI.
-    // Yêu cầu AI trả về định dạng JSON là RẤT QUAN TRỌNG.
     const prompt = `
-      Dựa trên nội dung sau đây:
+      Bạn là một giáo viên giỏi. Hãy tạo ${numQuestions} câu hỏi trắc nghiệm dựa trên nội dung bài học sau đây.
+      
+      NỘI DUNG BÀI HỌC:
       """
       ${content}
       """
-      Hãy tạo một bài trắc nghiệm gồm ${numQuestions} câu hỏi.
-      Mỗi câu hỏi phải có 4 lựa chọn (A, B, C, D) và chỉ MỘT đáp án đúng.
       
-      Vui lòng trả về kết quả CHÍNH XÁC dưới dạng một JSON array, KHÔNG có bất kỳ text nào khác.
-      Cấu trúc của mỗi object trong array phải là:
+      YÊU CẦU QUAN TRỌNG:
+      1. Câu hỏi phải bằng Tiếng Việt, rõ ràng, dễ hiểu.
+      2. Tuyệt đối KHÔNG trả về định dạng Markdown (không dùng \`\`\`json).
+      3. Chỉ trả về MỘT JSON Object duy nhất theo cấu trúc sau:
       {
-        "question": "Nội dung câu hỏi...",
-        "options": {
-          "A": "Lựa chọn A",
-          "B": "Lựa chọn B",
-          "C": "Lựa chọn C",
-          "D": "Lựa chọn D"
-        },
-        "correctAnswer": "A" 
+        "questions": [
+          {
+            "question": "Nội dung câu hỏi?",
+            "options": { "A": "Đáp án A", "B": "Đáp án B", "C": "Đáp án C", "D": "Đáp án D" },
+            "correctAnswer": "A"
+          }
+        ]
       }
     `;
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo", // Hoặc "gpt-4"
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.5, // Giảm độ "sáng tạo" để bám sát nội dung
-      response_format: { type: "json_object" }, // Yêu cầu trả về JSON (nếu model hỗ trợ)
-    });
+    console.log("Dang goi Gemini...");
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    let text = response.text();
 
-    // Lấy nội dung JSON string từ AI và parse nó
-    const jsonString = response.choices[0].message.content;
-    
-    // Đôi khi AI vẫn trả về JSON trong một code block, cần xử lý
-    const cleanedJsonString = jsonString.replace(/```json/g, '').replace(/```/g, '').trim();
+    console.log("Gemini tra loi (Raw):", text.substring(0, 100) + "...");
 
-    const quizData = JSON.parse(cleanedJsonString);
+    // Xử lý làm sạch JSON (Sanitize)
+    // Loại bỏ markdown code block nếu AI lỡ thêm vào
+    text = text.replace(/```json/g, '').replace(/```/g, '').trim();
     
-    // AI có thể trả về 1 object { "questions": [...] }, cần check
-    if (quizData.questions && Array.isArray(quizData.questions)) {
-      return quizData.questions; 
+    // Tìm điểm bắt đầu { và kết thúc } để cắt chuỗi rác
+    const firstBrace = text.indexOf('{');
+    const lastBrace = text.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1) {
+      text = text.substring(firstBrace, lastBrace + 1);
     }
-    // Hoặc trả về 1 array [...]
-    if (Array.isArray(quizData)) {
-      return quizData;
-    }
+
+    // Parse JSON
+    const data = JSON.parse(text);
     
-    throw new Error("AI response is not in expected format.");
+    // Chuẩn hóa đầu ra thành mảng câu hỏi
+    if (data.questions && Array.isArray(data.questions)) {
+      return data.questions;
+    } else if (Array.isArray(data)) {
+      return data;
+    }
+
+    throw new Error("AI response format invalid");
 
   } catch (error) {
-    console.error("Error calling AI API:", error);
-    throw new Error("Failed to generate quiz from AI");
+    console.error("Gemini Error:", error);
+    throw new Error("Failed to generate quiz with AI");
   }
 };
 
-/*
- * @route   POST /api/quizzes/generate
- * @desc    Tạo một bài trắc nghiệm mới từ các bài học đã chọn
- * @access  Private
- * @body    { "lessonIds": ["id1", "id2", ...], "title": "Quiz Tuần 1" }
- */
+// API: Tạo Quiz (Triggered by App)
 app.post('/api/quizzes/generate', checkAuth, async (req, res) => {
   const { lessonIds, title } = req.body;
   const userId = req.user.uid;
 
-  if (!lessonIds || lessonIds.length === 0) {
-    return res.status(400).send('lessonIds array is required');
-  }
+  if (!lessonIds?.length) return res.status(400).send('Missing lessonIds');
 
   try {
-    // Bước 1: Lấy nội dung text của các bài học từ Firebase
-    const content = await getLessonContentForAI(lessonIds);
-    if (content.trim().length === 0) {
-      return res.status(400).send('No content found for selected lessons. Check "textContent" field.');
+    // 1. Lấy nội dung từ DB
+    const content = await getLessonContent(lessonIds);
+    
+    // Kiểm tra nếu nội dung quá ngắn (chưa nạp dữ liệu)
+    if (!content || content.length < 20) {
+      return res.status(400).send('Nội dung bài học trống. Hãy kiểm tra lại dữ liệu.');
     }
 
-    // Bước 2: Gửi nội dung cho AI để tạo câu hỏi
-    const questions = await generateQuizWithAI(content, 5); // Tạo 5 câu
+    // 2. Gọi AI tạo câu hỏi
+    const questions = await generateQuizWithAI(content, 5);
 
-    // Bước 3: Lưu bài trắc nghiệm mới vào Firestore
-    const newQuizRef = await db.collection('quizzes').add({
-      userId: userId,
-      title: title || 'Bài trắc nghiệm',
-      lessonIds: lessonIds,
-      questions: questions, // Mảng câu hỏi từ AI
+    // 3. Lưu kết quả vào Firestore (bảng 'quizzes')
+    const quizRef = await db.collection('quizzes').add({
+      userId,
+      title: title || 'Bài kiểm tra',
+      lessonIds,
+      questions,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    // Bước 4: Gửi bài trắc nghiệm về cho client
+    // 4. Trả về cho Client
     res.status(201).json({
-      message: 'Quiz generated successfully',
-      quizId: newQuizRef.id,
-      quizData: {
-        id: newQuizRef.id,
-        userId,
-        title,
-        questions,
+      message: 'Quiz created successfully',
+      quizData: { 
+        id: quizRef.id, 
+        userId, 
+        title, 
+        questions 
       }
     });
 
   } catch (error) {
-    console.error(error);
+    console.error("API Error:", error);
     res.status(500).send('Error generating quiz');
   }
 });
 
-/*
- * @route   GET /api/quizzes
- * @desc    Lấy lịch sử các bài trắc nghiệm đã tạo của user
- * @access  Private
- */
+// API: Lấy lịch sử Quiz
 app.get('/api/quizzes', checkAuth, async (req, res) => {
   try {
     const userId = req.user.uid;
-    const quizzesSnapshot = await db.collection('quizzes')
-                                    .where('userId', '==', userId)
-                                    .orderBy('createdAt', 'desc')
-                                    .get();
-                                    
-    const quizzes = quizzesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    const snapshot = await db.collection('quizzes')
+                             .where('userId', '==', userId)
+                             .orderBy('createdAt', 'desc')
+                             .get();
+    
+    const quizzes = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     res.status(200).json(quizzes);
   } catch (error) {
     res.status(500).send('Error getting quizzes');
   }
 });
 
-
 // --- KHỞI ĐỘNG SERVER ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
