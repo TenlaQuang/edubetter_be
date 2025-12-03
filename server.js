@@ -3,33 +3,41 @@ const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const axios = require('axios'); // Dùng để gọi sang Python Server
 
-// --- CÀI ĐẶT ---
+// --- 1. CÀI ĐẶT FIREBASE ---
 const serviceAccount = require('./service-account.json');
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+if (admin.apps.length === 0) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+}
 
 const db = admin.firestore();
 
-const axios = require('axios'); // <-- Thêm dòng này
-
-// --- CẤU HÌNH AI ---
+// --- 2. CẤU HÌNH GEMINI AI (GOOGLE) ---
 // Quan trọng: Hãy đảm bảo bạn đã dán Key mới tạo vào đây
-const genAI = new GoogleGenerativeAI("YOUR_GEMINI_API_KEY"); 
+const genAI = new GoogleGenerativeAI("dán Key của bạn vào đây"); 
 
-// Sử dụng model cơ bản để đảm bảo tương thích tối đa
+// Sử dụng model cơ bản để đảm bảo tương thích tối đa, không dùng config JSON mode gây lỗi
 const model = genAI.getGenerativeModel({ 
-  model: "gemini-1.5-flash", 
+  model: "gemini-2.5-flash", 
 });
 
+// --- 3. CẤU HÌNH CHATBOT (PYTHON) ---
+// Link Ngrok của máy chạy Python (Thay đổi mỗi lần chạy Ngrok)
+const PYTHON_AI_URL = "https://xxxx-xxxx-xxxx.ngrok-free.app"; 
+
+// --- 4. CẤU HÌNH SERVER ---
 const app = express();
 app.use(cors());
 // Tăng giới hạn body để nhận được nội dung bài học dài (nếu cần)
 app.use(express.json({ limit: '10mb' })); 
 
-// --- MIDDLEWARE AUTH ---
+// ================= MIDDLEWARES =================
+
+// Xác thực người dùng (Kiểm tra Token)
 const checkAuth = async (req, res, next) => {
   const idToken = req.header('Authorization')?.replace('Bearer ', '');
   if (!idToken) return res.status(401).send('Unauthorized: No token provided');
@@ -44,269 +52,298 @@ const checkAuth = async (req, res, next) => {
   }
 };
 
-// --- ROUTES ---
+// Xác thực Admin (Chỉ cho phép Admin đi tiếp)
+const checkAdmin = async (req, res, next) => {
+  try {
+    const uid = req.user.uid;
+    const userDoc = await db.collection('users').doc(uid).get();
+    
+    if (!userDoc.exists || userDoc.data().role !== 'admin') {
+      return res.status(403).send('Access denied: Admins only');
+    }
+    next();
+  } catch (error) {
+    console.error('Admin Check Error:', error);
+    res.status(500).send('Server Error');
+  }
+};
 
-// 1. Tạo Profile User
+// ================= ROUTES API =================
+
+// --- A. QUẢN LÝ USER (ADMIN ONLY) ---
+
+// [R] Lấy danh sách user
+app.get('/api/admin/users', checkAuth, checkAdmin, async (req, res) => {
+  try {
+    const snapshot = await db.collection('users').orderBy('createdAt', 'desc').get();
+    const users = snapshot.docs.map(doc => doc.data());
+    res.json(users);
+  } catch (error) {
+    res.status(500).send('Error fetching users');
+  }
+});
+
+// [C] Tạo User mới (Admin tạo thủ công)
+app.post('/api/admin/users', checkAuth, checkAdmin, async (req, res) => {
+  try {
+    const { email, password, fullName, role, avatarUrl } = req.body;
+    const userRecord = await admin.auth().createUser({
+      email: email,
+      password: password,
+      displayName: fullName,
+      photoURL: avatarUrl || ''
+    });
+    await db.collection('users').doc(userRecord.uid).set({
+      uid: userRecord.uid,
+      email: email,
+      fullName: fullName,
+      role: role || 'student',
+      avatarUrl: avatarUrl || '',
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    res.status(201).json({ message: 'User created successfully', uid: userRecord.uid });
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+// [U] Cập nhật User
+app.put('/api/admin/users/:uid', checkAuth, checkAdmin, async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const { fullName, role, avatarUrl, email } = req.body;
+    await db.collection('users').doc(uid).update({ fullName, role, avatarUrl, email });
+    res.json({ message: `Updated user ${uid}` });
+  } catch (error) {
+    res.status(500).send('Error updating user');
+  }
+});
+
+// [U] Đổi quyền nhanh (Role)
+app.put('/api/admin/users/:uid/role', checkAuth, checkAdmin, async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const { role } = req.body;
+    await db.collection('users').doc(uid).update({ role });
+    res.json({ message: `Updated user role` });
+  } catch (error) {
+    res.status(500).send('Error updating role');
+  }
+});
+
+// [D] Xóa User
+app.delete('/api/admin/users/:uid', checkAuth, checkAdmin, async (req, res) => {
+  try {
+    const { uid } = req.params;
+    await db.collection('users').doc(uid).delete();
+    await admin.auth().deleteUser(uid);
+    res.json({ message: `Deleted user ${uid}` });
+  } catch (error) {
+    res.status(500).send('Error deleting user');
+  }
+});
+
+
+// --- B. QUẢN LÝ MÔN HỌC (SUBJECTS) - ADMIN ---
+
+app.post('/api/admin/subjects', checkAuth, checkAdmin, async (req, res) => {
+  try {
+    const { id, name, description, thumbnailUrl } = req.body;
+    const docRef = id ? db.collection('subjects').doc(id) : db.collection('subjects').doc();
+    await docRef.set({ id: docRef.id, name, description, thumbnailUrl });
+    res.status(201).json({ message: 'Subject created', id: docRef.id });
+  } catch (error) { res.status(500).send('Error creating subject'); }
+});
+
+app.put('/api/admin/subjects/:id', checkAuth, checkAdmin, async (req, res) => {
+  try {
+    await db.collection('subjects').doc(req.params.id).update(req.body);
+    res.json({ message: 'Subject updated' });
+  } catch (error) { res.status(500).send('Error updating subject'); }
+});
+
+app.delete('/api/admin/subjects/:id', checkAuth, checkAdmin, async (req, res) => {
+  try {
+    await db.collection('subjects').doc(req.params.id).delete();
+    res.json({ message: 'Subject deleted' });
+  } catch (error) { res.status(500).send('Error deleting subject'); }
+});
+
+
+// --- C. QUẢN LÝ BÀI HỌC (LESSONS) - ADMIN ---
+
+app.post('/api/admin/lessons', checkAuth, checkAdmin, async (req, res) => {
+  try {
+    const docRef = await db.collection('lessons').add(req.body);
+    res.status(201).json({ message: 'Lesson created', id: docRef.id });
+  } catch (error) { res.status(500).send('Error creating lesson'); }
+});
+
+app.put('/api/admin/lessons/:id', checkAuth, checkAdmin, async (req, res) => {
+  try {
+    await db.collection('lessons').doc(req.params.id).update(req.body);
+    res.json({ message: 'Lesson updated' });
+  } catch (error) { res.status(500).send('Error updating lesson'); }
+});
+
+app.delete('/api/admin/lessons/:id', checkAuth, checkAdmin, async (req, res) => {
+  try {
+    await db.collection('lessons').doc(req.params.id).delete();
+    res.json({ message: 'Lesson deleted' });
+  } catch (error) { res.status(500).send('Error deleting lesson'); }
+});
+
+
+// --- D. PUBLIC API (CHO APP MOBILE) ---
+
+// Tạo Profile khi đăng ký
 app.post('/api/users/create-profile', checkAuth, async (req, res) => {
   try {
     const { uid, email } = req.user;
     const { fullName, avatarUrl } = req.body;
-
-    await db.collection('users').doc(uid).set({
-      uid, email,
-      fullName: fullName || '',
-      avatarUrl: avatarUrl || '',
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
-
-    res.status(201).send({ message: 'User profile created', uid });
-  } catch (error) {
-    res.status(500).send('Error creating user profile');
-  }
+    const userRef = db.collection('users').doc(uid);
+    const doc = await userRef.get();
+    if (!doc.exists) {
+      await userRef.set({ uid, email, fullName, avatarUrl, role: 'student', createdAt: admin.firestore.FieldValue.serverTimestamp() });
+    }
+    res.status(201).send({ message: 'User profile synced', uid });
+  } catch (error) { res.status(500).send('Error'); }
 });
 
-// 2. Lấy danh sách Môn học (Subjects)
-// API này map dữ liệu từ bảng 'subjects' sang format Client cần
+// Lấy danh sách môn học
 app.get('/api/courses', checkAuth, async (req, res) => {
   try {
     const snapshot = await db.collection('subjects').get();
     const subjects = snapshot.docs.map(doc => {
       const data = doc.data();
-      return {
-        id: doc.id,
-        name: data.name, 
-        title: data.name, // Fallback cho client cũ
-        description: data.description,
-        thumbnailUrl: data.thumbnailUrl
-      };
+      return { id: doc.id, name: data.name, title: data.name, description: data.description, thumbnailUrl: data.thumbnailUrl };
     });
     res.status(200).json(subjects);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send('Error getting subjects');
-  }
+  } catch (error) { res.status(500).send('Error'); }
 });
 
-// 3. Lấy bài học theo Môn học
+// Lấy danh sách bài học
 app.get('/api/courses/:subjectId/lessons', checkAuth, async (req, res) => {
   try {
-    const { subjectId } = req.params;
-    // Tìm các bài học có subjectId trùng khớp
-    const snapshot = await db.collection('lessons')
-                             .where('subjectId', '==', subjectId)
-                             .get();
-    
-    const lessons = snapshot.docs
-      .map(doc => ({ id: doc.id, ...doc.data() }))
-      .sort((a, b) => (a.orderIndex || 0) - (b.orderIndex || 0));
-                                    
+    const snapshot = await db.collection('lessons').where('subjectId', '==', req.params.subjectId).get();
+    const lessons = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })).sort((a, b) => (a.orderIndex || 0) - (b.orderIndex || 0));
     res.status(200).json(lessons);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send('Error getting lessons');
-  }
+  } catch (error) { res.status(500).send('Error'); }
 });
 
-// --- LOGIC TẠO QUIZ THÔNG MINH ---
 
-// Hàm helper: Lấy nội dung bài học từ Firestore
+// --- E. TÍNH NĂNG TẠO QUIZ VỚI GEMINI AI ---
+
 const getLessonContent = async (lessonIds) => {
   let combinedContent = "";
   try {
     const promises = lessonIds.map(id => db.collection('lessons').doc(id).get());
     const docs = await Promise.all(promises);
-
     for (const doc of docs) {
       if (doc.exists) {
         const data = doc.data();
         combinedContent += `--- BÀI HỌC: ${data.title} ---\n`;
-        
-        // Ưu tiên số 1: Nội dung văn bản (SGK)
+        // Ưu tiên lấy text content (SGK)
         if (data.textContent && data.textContent.trim().length > 0) {
           combinedContent += data.textContent;
-        } 
-        // Ưu tiên số 2: Link Video (nếu không có text)
-        else if (data.videoUrl) {
-          combinedContent += `(Chỉ có video tham khảo: ${data.videoUrl})`;
+        } else if (data.videoUrl) {
+          combinedContent += `(Nội dung video: ${data.videoUrl})`;
         }
         combinedContent += `\n---------------------------\n`;
       }
     }
     return combinedContent;
-  } catch (error) {
-    throw new Error("Failed to get lesson content from DB");
-  }
+  } catch (error) { throw new Error("Failed to get content"); }
 };
 
-// Hàm helper: Gọi Gemini API
 const generateQuizWithAI = async (content, numQuestions = 5) => {
   try {
     const prompt = `
-      Bạn là một giáo viên giỏi. Hãy tạo ${numQuestions} câu hỏi trắc nghiệm dựa trên nội dung bài học sau đây.
+      Bạn là giáo viên. Hãy tạo ${numQuestions} câu hỏi trắc nghiệm từ nội dung sau.
+      Trả về duy nhất JSON object (không markdown) theo mẫu: 
+      { "questions": [{ "question": "...", "options": {"A":"...", "B":"...", "C":"...", "D":"..."}, "correctAnswer": "A" }] }
       
-      NỘI DUNG BÀI HỌC:
-      """
+      Nội dung bài học:
       ${content}
-      """
-      
-      YÊU CẦU QUAN TRỌNG:
-      1. Câu hỏi phải bằng Tiếng Việt, rõ ràng, dễ hiểu.
-      2. Tuyệt đối KHÔNG trả về định dạng Markdown (không dùng \`\`\`json).
-      3. Chỉ trả về MỘT JSON Object duy nhất theo cấu trúc sau:
-      {
-        "questions": [
-          {
-            "question": "Nội dung câu hỏi?",
-            "options": { "A": "Đáp án A", "B": "Đáp án B", "C": "Đáp án C", "D": "Đáp án D" },
-            "correctAnswer": "A"
-          }
-        ]
-      }
     `;
 
-    console.log("Dang goi Gemini...");
+    console.log("Đang gọi Gemini tạo Quiz...");
     const result = await model.generateContent(prompt);
-    const response = await result.response;
-    let text = response.text();
+    let text = result.response.text();
 
-    console.log("Gemini tra loi (Raw):", text.substring(0, 100) + "...");
-
-    // Xử lý làm sạch JSON (Sanitize)
-    // Loại bỏ markdown code block nếu AI lỡ thêm vào
+    // Xử lý làm sạch JSON
     text = text.replace(/```json/g, '').replace(/```/g, '').trim();
-    
-    // Tìm điểm bắt đầu { và kết thúc } để cắt chuỗi rác
     const firstBrace = text.indexOf('{');
     const lastBrace = text.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1) {
-      text = text.substring(firstBrace, lastBrace + 1);
-    }
-
-    // Parse JSON
-    const data = JSON.parse(text);
+    if (firstBrace !== -1 && lastBrace !== -1) text = text.substring(firstBrace, lastBrace + 1);
     
-    // Chuẩn hóa đầu ra thành mảng câu hỏi
-    if (data.questions && Array.isArray(data.questions)) {
-      return data.questions;
-    } else if (Array.isArray(data)) {
-      return data;
-    }
-
-    throw new Error("AI response format invalid");
-
-  } catch (error) {
-    console.error("Gemini Error:", error);
-    throw new Error("Failed to generate quiz with AI");
-  }
+    const data = JSON.parse(text);
+    if (data.questions) return data.questions;
+    if (Array.isArray(data)) return data;
+    throw new Error("Invalid format");
+  } catch (error) { console.error("Gemini Error:", error); throw error; }
 };
 
-// API: Tạo Quiz (Triggered by App)
 app.post('/api/quizzes/generate', checkAuth, async (req, res) => {
   const { lessonIds, title } = req.body;
-  const userId = req.user.uid;
-
+  // Lưu ý: User thường cũng được tạo Quiz để ôn tập nên không checkAdmin ở đây
   if (!lessonIds?.length) return res.status(400).send('Missing lessonIds');
-
+  
   try {
-    // 1. Lấy nội dung từ DB
     const content = await getLessonContent(lessonIds);
+    if (!content || content.length < 20) return res.status(400).send('Nội dung bài học trống/quá ngắn');
     
-    // Kiểm tra nếu nội dung quá ngắn (chưa nạp dữ liệu)
-    if (!content || content.length < 20) {
-      return res.status(400).send('Nội dung bài học trống. Hãy kiểm tra lại dữ liệu.');
-    }
-
-    // 2. Gọi AI tạo câu hỏi
     const questions = await generateQuizWithAI(content, 5);
-
-    // 3. Lưu kết quả vào Firestore (bảng 'quizzes')
+    
     const quizRef = await db.collection('quizzes').add({
-      userId,
-      title: title || 'Bài kiểm tra',
-      lessonIds,
-      questions,
+      userId: req.user.uid, 
+      title: title || 'Quiz ôn tập', 
+      lessonIds, 
+      questions, 
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
-
-    // 4. Trả về cho Client
-    res.status(201).json({
-      message: 'Quiz created successfully',
-      quizData: { 
-        id: quizRef.id, 
-        userId, 
-        title, 
-        questions 
-      }
-    });
-
-  } catch (error) {
-    console.error("API Error:", error);
-    res.status(500).send('Error generating quiz');
-  }
+    
+    res.status(201).json({ message: 'Success', quizData: { id: quizRef.id, userId: req.user.uid, title, questions } });
+  } catch (error) { res.status(500).send('Error generating quiz'); }
 });
 
-// API: Lấy lịch sử Quiz
 app.get('/api/quizzes', checkAuth, async (req, res) => {
   try {
-    const userId = req.user.uid;
-    const snapshot = await db.collection('quizzes')
-                             .where('userId', '==', userId)
-                             .orderBy('createdAt', 'desc')
-                             .get();
-    
-    const quizzes = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.status(200).json(quizzes);
-  } catch (error) {
-    res.status(500).send('Error getting quizzes');
-  }
+    const snapshot = await db.collection('quizzes').where('userId', '==', req.user.uid).orderBy('createdAt', 'desc').get();
+    res.status(200).json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+  } catch (error) { res.status(500).send('Error'); }
 });
-// ============================================================
-// [TÍNH NĂNG] CHAT BOT AI (GỌI SANG PYTHON SERVER)
-// ============================================================
 
-// Cấu hình Link Ngrok của máy Python (Thay đổi mỗi lần chạy Ngrok)
-// Đây là link bạn copy từ màn hình đen của Ngrok bên máy Python
-const PYTHON_AI_URL = "https://xxxx-xxxx-xxxx.ngrok-free.app"; 
+
+// --- F. TÍNH NĂNG CHATBOT (GỌI SANG PYTHON SERVER) ---
 
 app.post('/api/chat-tutor', checkAuth, async (req, res) => {
   try {
     const { question } = req.body;
-    
-    if (!question) {
-      return res.status(400).send("Vui lòng nhập câu hỏi.");
-    }
+    if (!question) return res.status(400).send("Vui lòng nhập câu hỏi.");
 
-    console.log(`[NodeJS] Đang chuyển câu hỏi sang Python: "${question}"`);
+    console.log(`[NodeJS -> Python] Câu hỏi: "${question}"`);
 
-    // --- GỌI SANG SERVER PYTHON (Qua Ngrok) ---
+    // Gọi sang Server Python qua Ngrok
     const response = await axios.post(`${PYTHON_AI_URL}/api/chat`, {
       question: question,
-      subject: "General"
+      subject: "General" // Hoặc lấy môn học từ client nếu có
     });
 
-    // Nhận dữ liệu từ Python: { answer: "...", sources: [...] }
-    const aiData = response.data;
-
-    // Trả về cho App Flutter
-    res.json({
-      success: true,
-      data: aiData
-    });
+    res.json({ success: true, data: response.data });
 
   } catch (error) {
     console.error("Lỗi kết nối Python AI:", error.message);
-    
-    // Xử lý lỗi nếu server Python chưa bật hoặc Ngrok sai link
     if (error.code === 'ECONNREFUSED' || error.response?.status === 404) {
       return res.status(503).send("Gia sư AI đang ngủ (Server Python chưa bật).");
     }
-    
     res.status(500).send("Lỗi hệ thống AI.");
   }
 });
-// ============================================================
+
+
 // --- KHỞI ĐỘNG SERVER ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server hoàn chỉnh đang chạy trên cổng ${PORT}`);
 });
