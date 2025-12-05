@@ -18,7 +18,7 @@ const db = admin.firestore();
 
 // --- 2. CẤU HÌNH GEMINI AI (GOOGLE) ---
 // Quan trọng: Hãy đảm bảo bạn đã dán Key mới tạo vào đây
-const genAI = new GoogleGenerativeAI("dán Key của bạn vào đây"); 
+const genAI = new GoogleGenerativeAI("AIzaSyDDfmBNK9aO2CMSNjf7Rn1CL5zAAUdw-w8"); 
 
 // Sử dụng model cơ bản để đảm bảo tương thích tối đa, không dùng config JSON mode gây lỗi
 const model = genAI.getGenerativeModel({ 
@@ -87,37 +87,63 @@ app.get('/api/admin/users', checkAuth, checkAdmin, async (req, res) => {
 app.post('/api/admin/users', checkAuth, checkAdmin, async (req, res) => {
   try {
     const { email, password, fullName, role, avatarUrl } = req.body;
+
+    // 1. Tạo tài khoản trong Firebase Authentication
+    // LƯU Ý: KHÔNG truyền avatarUrl vào đây nếu nó là Base64
     const userRecord = await admin.auth().createUser({
       email: email,
       password: password,
       displayName: fullName,
-      photoURL: avatarUrl || ''
+      // photoURL: avatarUrl || '' // <--- XÓA DÒNG NÀY ĐI
     });
+
+    // 2. Tạo thông tin chi tiết trong Firestore
+    // Firestore chấp nhận chuỗi Base64 (miễn là < 1MB)
     await db.collection('users').doc(userRecord.uid).set({
       uid: userRecord.uid,
       email: email,
       fullName: fullName,
       role: role || 'student',
-      avatarUrl: avatarUrl || '',
+      avatarUrl: avatarUrl || '', // Lưu Base64 vào đây
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    res.status(201).json({ message: 'User created successfully', uid: userRecord.uid });
+
+    res.status(201).json({ 
+      message: 'User created successfully', 
+      uid: userRecord.uid 
+    });
+
   } catch (error) {
+    console.error("Error creating user:", error);
     res.status(500).send({ error: error.message });
   }
 });
 
-// [U] Cập nhật User
+// [U] Cập nhật thông tin User
 app.put('/api/admin/users/:uid', checkAuth, checkAdmin, async (req, res) => {
   try {
     const { uid } = req.params;
     const { fullName, role, avatarUrl, email } = req.body;
-    await db.collection('users').doc(uid).update({ fullName, role, avatarUrl, email });
+    
+    // 1. Cập nhật trong Firestore (Nơi quan trọng nhất để hiển thị)
+    await db.collection('users').doc(uid).update({ 
+      fullName, role, avatarUrl, email
+    });
+
+    // 2. Cập nhật trong Firebase Auth (Chỉ cập nhật Tên và Email)
+    // Bỏ qua cập nhật photoURL để tránh lỗi Base64
+    await admin.auth().updateUser(uid, { 
+      displayName: fullName, 
+      email: email 
+    });
+
     res.json({ message: `Updated user ${uid}` });
   } catch (error) {
+    console.error("Error updating user:", error);
     res.status(500).send('Error updating user');
   }
 });
+
 
 // [U] Đổi quyền nhanh (Role)
 app.put('/api/admin/users/:uid/role', checkAuth, checkAdmin, async (req, res) => {
@@ -210,16 +236,60 @@ app.post('/api/users/create-profile', checkAuth, async (req, res) => {
   } catch (error) { res.status(500).send('Error'); }
 });
 
-// Lấy danh sách môn học
+// [R] Lấy danh sách Môn học (Kèm tiến độ học tập)
 app.get('/api/courses', checkAuth, async (req, res) => {
   try {
-    const snapshot = await db.collection('subjects').get();
-    const subjects = snapshot.docs.map(doc => {
+    const userId = req.user.uid;
+
+    // 1. Lấy tất cả môn học
+    const subjectsSnapshot = await db.collection('subjects').get();
+    
+    // 2. Lấy tất cả bài học (để đếm tổng số bài mỗi môn)
+    // (Trong thực tế nếu nhiều dữ liệu nên dùng aggregation query hoặc lưu count vào subject)
+    const lessonsSnapshot = await db.collection('lessons').get();
+    const lessonCounts = {}; // Map: { subjectId: totalLessons }
+    
+    lessonsSnapshot.forEach(doc => {
       const data = doc.data();
-      return { id: doc.id, name: data.name, title: data.name, description: data.description, thumbnailUrl: data.thumbnailUrl };
+      const subId = data.subjectId;
+      lessonCounts[subId] = (lessonCounts[subId] || 0) + 1;
     });
+
+    // 3. Lấy tiến độ học của User (Bảng learning_progress)
+    // Giả sử bảng này lưu: { userId: "...", lessonId: "...", subjectId: "...", isCompleted: true }
+    const progressSnapshot = await db.collection('learning_progress')
+                                    .where('userId', '==', userId)
+                                    .where('isCompleted', '==', true)
+                                    .get();
+    
+    const userProgress = {}; // Map: { subjectId: completedCount }
+    progressSnapshot.forEach(doc => {
+      const data = doc.data();
+      const subId = data.subjectId;
+      userProgress[subId] = (userProgress[subId] || 0) + 1;
+    });
+
+    // 4. Gộp dữ liệu trả về
+    const subjects = subjectsSnapshot.docs.map(doc => {
+      const data = doc.data();
+      const subjectId = doc.id;
+      return {
+        id: subjectId,
+        name: data.name,
+        title: data.name, 
+        description: data.description,
+        thumbnailUrl: data.thumbnailUrl,
+        // Thêm 2 trường này
+        totalLessons: lessonCounts[subjectId] || 0,
+        completedLessons: userProgress[subjectId] || 0
+      };
+    });
+
     res.status(200).json(subjects);
-  } catch (error) { res.status(500).send('Error'); }
+  } catch (error) {
+    console.error(error);
+    res.status(500).send('Error getting subjects');
+  }
 });
 
 // Lấy danh sách bài học
@@ -229,6 +299,44 @@ app.get('/api/courses/:subjectId/lessons', checkAuth, async (req, res) => {
     const lessons = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })).sort((a, b) => (a.orderIndex || 0) - (b.orderIndex || 0));
     res.status(200).json(lessons);
   } catch (error) { res.status(500).send('Error'); }
+});
+
+// [C/U] Cập nhật tiến độ học tập (Đánh dấu hoàn thành)
+app.post('/api/learning-progress', checkAuth, async (req, res) => {
+  try {
+    const { userId, lessonId, subjectId, isCompleted } = req.body;
+    
+    // Tìm xem đã có bản ghi tiến độ chưa
+    const progressRef = db.collection('learning_progress');
+    const snapshot = await progressRef
+      .where('userId', '==', userId)
+      .where('lessonId', '==', lessonId)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      // Chưa có -> Tạo mới
+      await progressRef.add({
+        userId,
+        lessonId,
+        subjectId,
+        isCompleted: isCompleted || true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } else {
+      // Đã có -> Cập nhật
+      const docId = snapshot.docs[0].id;
+      await progressRef.doc(docId).update({
+        isCompleted: isCompleted,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+
+    res.json({ message: 'Progress updated' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send('Error updating progress');
+  }
 });
 
 
@@ -325,7 +433,7 @@ app.post('/api/chat-tutor', checkAuth, async (req, res) => {
     console.log(`[NodeJS -> Python] Câu hỏi: "${question}"`);
 
     // Gọi sang Server Python qua Ngrok
-    const response = await axios.post(`${PYTHON_AI_URL}/api/chat`, {
+    const response = await axios.post(`https://stipulatory-lavada-nonegoistically.ngrok-free.dev/api/chat`, {
       question: question,
       subject: "General" // Hoặc lấy môn học từ client nếu có
     });
