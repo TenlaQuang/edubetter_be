@@ -1,4 +1,5 @@
 // server.js
+
 const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
@@ -18,7 +19,7 @@ const db = admin.firestore();
 
 // --- 2. CẤU HÌNH GEMINI AI (GOOGLE) ---
 // Quan trọng: Hãy đảm bảo bạn đã dán Key mới tạo vào đây
-const genAI = new GoogleGenerativeAI("AIzaSyDDfmBNK9aO2CMSNjf7Rn1CL5zAAUdw-w8"); 
+const genAI = new GoogleGenerativeAI("dán_api_key_của_bạn_vào_đây"); 
 
 // Sử dụng model cơ bản để đảm bảo tương thích tối đa, không dùng config JSON mode gây lỗi
 const model = genAI.getGenerativeModel({ 
@@ -32,9 +33,8 @@ const PYTHON_AI_URL = "https://xxxx-xxxx-xxxx.ngrok-free.app";
 // --- 4. CẤU HÌNH SERVER ---
 const app = express();
 app.use(cors());
-// Tăng giới hạn body để nhận được nội dung bài học dài (nếu cần)
-app.use(express.json({ limit: '10mb' })); 
-
+app.use(express.json({ limit: '50mb' })); 
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // ================= MIDDLEWARES =================
 
 // Xác thực người dùng (Kiểm tra Token)
@@ -340,9 +340,10 @@ app.post('/api/learning-progress', checkAuth, async (req, res) => {
 });
 
 
-// --- E. TÍNH NĂNG TẠO QUIZ VỚI GEMINI AI ---
 
-const getLessonContent = async (lessonIds) => {
+// --- E. AI QUIZ LOGIC (NÂNG CẤP) ---
+
+const getLessonContent = async (lessonIds) => { 
   let combinedContent = "";
   try {
     const promises = lessonIds.map(id => db.collection('lessons').doc(id).get());
@@ -350,24 +351,20 @@ const getLessonContent = async (lessonIds) => {
     for (const doc of docs) {
       if (doc.exists) {
         const data = doc.data();
-        combinedContent += `--- BÀI HỌC: ${data.title} ---\n`;
-        // Ưu tiên lấy text content (SGK)
-        if (data.textContent && data.textContent.trim().length > 0) {
-          combinedContent += data.textContent;
-        } else if (data.videoUrl) {
-          combinedContent += `(Nội dung video: ${data.videoUrl})`;
-        }
-        combinedContent += `\n---------------------------\n`;
+        if (data.textContent) combinedContent += `--- BÀI: ${data.title} ---\n${data.textContent}\n`;
+        else if (data.videoUrl) combinedContent += `(Video: ${data.videoUrl})`;
       }
     }
     return combinedContent;
   } catch (error) { throw new Error("Failed to get content"); }
 };
 
-const generateQuizWithAI = async (content, numQuestions = 5) => {
+// Cập nhật hàm này để nhận numQuestions
+const generateQuizWithAI = async (content, numQuestions) => { 
   try {
+    // Thêm numQuestions vào prompt
     const prompt = `
-      Bạn là giáo viên. Hãy tạo ${numQuestions} câu hỏi trắc nghiệm từ nội dung sau.
+      Bạn là một giáo viên giỏi. Hãy tạo chính xác ${numQuestions} câu hỏi trắc nghiệm từ nội dung sau.
       Trả về duy nhất JSON object (không markdown) theo mẫu: 
       { "questions": [{ "question": "...", "options": {"A":"...", "B":"...", "C":"...", "D":"..."}, "correctAnswer": "A" }] }
       
@@ -375,12 +372,9 @@ const generateQuizWithAI = async (content, numQuestions = 5) => {
       ${content}
     `;
 
-    console.log("Đang gọi Gemini tạo Quiz...");
+    console.log(`Đang gọi Gemini tạo ${numQuestions} câu hỏi...`);
     const result = await model.generateContent(prompt);
-    let text = result.response.text();
-
-    // Xử lý làm sạch JSON
-    text = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    let text = result.response.text().replace(/```json/g, '').replace(/```/g, '').trim();
     const firstBrace = text.indexOf('{');
     const lastBrace = text.lastIndexOf('}');
     if (firstBrace !== -1 && lastBrace !== -1) text = text.substring(firstBrace, lastBrace + 1);
@@ -389,65 +383,264 @@ const generateQuizWithAI = async (content, numQuestions = 5) => {
     if (data.questions) return data.questions;
     if (Array.isArray(data)) return data;
     throw new Error("Invalid format");
-  } catch (error) { console.error("Gemini Error:", error); throw error; }
+  } catch (error) { throw error; }
 };
 
 app.post('/api/quizzes/generate', checkAuth, async (req, res) => {
-  const { lessonIds, title } = req.body;
-  // Lưu ý: User thường cũng được tạo Quiz để ôn tập nên không checkAdmin ở đây
+  const { lessonIds, title, numberOfQuestions } = req.body; // Nhận thêm numberOfQuestions
+  
   if (!lessonIds?.length) return res.status(400).send('Missing lessonIds');
   
+  // Xác định số lượng câu hỏi (mặc định 5 nếu không gửi)
+  let count = 5;
+  if (numberOfQuestions) {
+    count = parseInt(numberOfQuestions);
+    // Giới hạn để tránh lỗi hoặc quá tải (ví dụ max 30 câu)
+    if (count > 30) count = 30;
+    if (count < 1) count = 5;
+  }
+
   try {
     const content = await getLessonContent(lessonIds);
-    if (!content || content.length < 20) return res.status(400).send('Nội dung bài học trống/quá ngắn');
+    if (!content || content.length < 20) return res.status(400).send('Nội dung trống');
     
-    const questions = await generateQuizWithAI(content, 5);
+    const questions = await generateQuizWithAI(content, count);
     
+    // Lưu vào Firestore (Đã bao gồm chức năng lịch sử)
     const quizRef = await db.collection('quizzes').add({
       userId: req.user.uid, 
       title: title || 'Quiz ôn tập', 
       lessonIds, 
       questions, 
+      // Lưu thêm số câu hỏi để sau này thống kê nếu cần
+      questionCount: questions.length,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
     
     res.status(201).json({ message: 'Success', quizData: { id: quizRef.id, userId: req.user.uid, title, questions } });
-  } catch (error) { res.status(500).send('Error generating quiz'); }
+  } catch (error) { 
+    console.error(error);
+    res.status(500).send('Error generating quiz'); 
+  }
 });
 
+// API Lấy Lịch sử Quiz (Đã sửa lỗi ngày tháng)
 app.get('/api/quizzes', checkAuth, async (req, res) => {
   try {
-    const snapshot = await db.collection('quizzes').where('userId', '==', req.user.uid).orderBy('createdAt', 'desc').get();
-    res.status(200).json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-  } catch (error) { res.status(500).send('Error'); }
+    const snapshot = await db.collection('quizzes')
+                             .where('userId', '==', req.user.uid)
+                             .orderBy('createdAt', 'desc')
+                             .get();
+    
+    const quizzes = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return { 
+        id: doc.id, 
+        ...data,
+        // CHUYỂN ĐỔI TIMESTAMP SANG STRING TRÁNH LỖI FLUTTER
+        createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null
+      };
+    });
+    
+    res.status(200).json(quizzes);
+  } catch (error) {
+    console.error("Lỗi lấy lịch sử Quiz:", error);
+    // In ra lỗi cụ thể để bạn xem trong terminal (thường là lỗi thiếu Index)
+    res.status(500).send(`Error getting quizzes: ${error.message}`); 
+  }
 });
 
+// --- G. TÍNH NĂNG CHAT HISTORY (FIX LỖI NGÀY THÁNG) ---
 
-// --- F. TÍNH NĂNG CHATBOT (GỌI SANG PYTHON SERVER) ---
+// 1. Tạo Phiên Chat Mới
+app.post('/api/chat/sessions', checkAuth, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const { title } = req.body; 
 
+    const sessionRef = await db.collection('chat_sessions').add({
+      userId: userId,
+      title: title || 'Cuộc trò chuyện mới',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.status(201).json({ 
+      sessionId: sessionRef.id, 
+      title: 'Cuộc trò chuyện mới',
+      createdAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send('Error creating chat session');
+  }
+});
+
+// 2. Lấy danh sách các Phiên Chat (Đã Fix lỗi Map/String)
+app.get('/api/chat/sessions', checkAuth, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const snapshot = await db.collection('chat_sessions')
+                             .where('userId', '==', userId)
+                             .orderBy('updatedAt', 'desc')
+                             .get();
+    
+    const sessions = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        ...data,
+        // QUAN TRỌNG: Chuyển Timestamp của Firestore thành chuỗi ISO String
+        createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null,
+        updatedAt: data.updatedAt ? data.updatedAt.toDate().toISOString() : null
+      };
+    });
+    res.json(sessions);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send('Error fetching chat sessions');
+  }
+});
+
+// 3. Lấy tin nhắn của một phiên (Đã Fix lỗi Map/String)
+app.get('/api/chat/sessions/:sessionId/messages', checkAuth, async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const snapshot = await db.collection('chat_messages')
+                             .where('sessionId', '==', sessionId)
+                             .orderBy('createdAt', 'asc')
+                             .get();
+    
+    const messages = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        ...data,
+        // Chuyển Timestamp sang chuỗi
+        createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null
+      };
+    });
+    res.json(messages);
+  } catch (error) {
+    res.status(500).send('Error fetching messages');
+  }
+});
+
+// 4. Gửi tin nhắn & Gọi AI (ĐÃ SỬA LỖI CRASH NOT_FOUND)
 app.post('/api/chat-tutor', checkAuth, async (req, res) => {
   try {
-    const { question } = req.body;
+    const { question, sessionId } = req.body;
+    const userId = req.user.uid;
+
     if (!question) return res.status(400).send("Vui lòng nhập câu hỏi.");
+
+    let currentSessionId = sessionId;
+    let sessionRef;
+
+    // --- BƯỚC 1: XỬ LÝ SESSION ID VÀ TẠO SESSION NẾU CHƯA CÓ ---
+    if (!currentSessionId) {
+      // Trường hợp 1: Client không gửi ID -> Tạo mới hoàn toàn (Auto ID)
+      sessionRef = db.collection('chat_sessions').doc();
+      currentSessionId = sessionRef.id;
+      
+      await sessionRef.set({
+        userId,
+        title: question.substring(0, 30) + "...",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } else {
+      // Trường hợp 2: Client gửi ID lên (VD: 1765039451932)
+      // Cần kiểm tra xem ID này đã có trong DB chưa. Nếu chưa thì phải tạo (SET) thay vì Update.
+      sessionRef = db.collection('chat_sessions').doc(currentSessionId);
+      const docSnap = await sessionRef.get();
+
+      if (!docSnap.exists) {
+        // Nếu chưa tồn tại -> Tạo mới với ID do Client gửi
+        await sessionRef.set({
+          userId,
+          title: question.substring(0, 30) + "...",
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      }
+    }
+
+    // --- BƯỚC 2: LƯU TIN NHẮN USER ---
+    await db.collection('chat_messages').add({
+      sessionId: currentSessionId,
+      sender: 'user',
+      text: question,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
 
     console.log(`[NodeJS -> Python] Câu hỏi: "${question}"`);
 
-    // Gọi sang Server Python qua Ngrok
+    // --- BƯỚC 3: GỌI AI ---
     const response = await axios.post(`https://stipulatory-lavada-nonegoistically.ngrok-free.dev/api/chat`, {
       question: question,
-      subject: "General" // Hoặc lấy môn học từ client nếu có
+      subject: "General" 
     });
 
-    res.json({ success: true, data: response.data });
+    const aiAnswer = response.data.answer;
+
+    // --- BƯỚC 4: LƯU TIN NHẮN BOT ---
+    await db.collection('chat_messages').add({
+      sessionId: currentSessionId,
+      sender: 'bot',
+      text: aiAnswer,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // --- BƯỚC 5: CẬP NHẬT THỜI GIAN SESSION (SỬA LỖI TẠI ĐÂY) ---
+    // Dùng set với merge: true để an toàn hơn update (tránh crash nếu doc bị xóa giữa chừng)
+    await db.collection('chat_sessions').doc(currentSessionId).set({
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    res.json({ 
+      success: true, 
+      data: response.data,
+      sessionId: currentSessionId 
+    });
 
   } catch (error) {
-    console.error("Lỗi kết nối Python AI:", error.message);
+    console.error("Lỗi xử lý Chat:", error.message);
+    // Phân biệt lỗi để debug dễ hơn
+    if (error.code === 5 || error.message.includes('NOT_FOUND')) {
+       return res.status(500).send("Lỗi Database: Không tìm thấy phiên chat để cập nhật.");
+    }
     if (error.code === 'ECONNREFUSED' || error.response?.status === 404) {
       return res.status(503).send("Gia sư AI đang ngủ (Server Python chưa bật).");
     }
-    res.status(500).send("Lỗi hệ thống AI.");
+    res.status(500).send("Lỗi hệ thống: " + error.message);
   }
 });
+
+// // --- F. TÍNH NĂNG CHATBOT (GỌI SANG PYTHON SERVER) ---
+
+// app.post('/api/chat-tutor', checkAuth, async (req, res) => {
+//   try {
+//     const { question } = req.body;
+//     if (!question) return res.status(400).send("Vui lòng nhập câu hỏi.");
+
+//     console.log(`[NodeJS -> Python] Câu hỏi: "${question}"`);
+
+//     // Gọi sang Server Python qua Ngrok
+//     const response = await axios.post(`https://stipulatory-lavada-nonegoistically.ngrok-free.dev/api/chat`, {
+//       question: question,
+//       subject: "General" // Hoặc lấy môn học từ client nếu có
+//     });
+
+//     res.json({ success: true, data: response.data });
+
+//   } catch (error) {
+//     console.error("Lỗi kết nối Python AI:", error.message);
+//     if (error.code === 'ECONNREFUSED' || error.response?.status === 404) {
+//       return res.status(503).send("Gia sư AI đang ngủ (Server Python chưa bật).");
+//     }
+//     res.status(500).send("Lỗi hệ thống AI.");
+//   }
+// });
 
 
 // --- KHỞI ĐỘNG SERVER ---
