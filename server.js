@@ -19,7 +19,7 @@ const db = admin.firestore();
 
 // --- 2. CẤU HÌNH GEMINI AI (GOOGLE) ---
 // Quan trọng: Hãy đảm bảo bạn đã dán Key mới tạo vào đây
-const genAI = new GoogleGenerativeAI("dán_api_key_của_bạn_vào_đây"); 
+const genAI = new GoogleGenerativeAI("AIzaSyDpDgjWuKLGc7cBUsyv9ne-r3A1Ur7XMsA"); 
 
 // Sử dụng model cơ bản để đảm bảo tương thích tối đa, không dùng config JSON mode gây lỗi
 const model = genAI.getGenerativeModel({ 
@@ -221,6 +221,58 @@ app.delete('/api/admin/lessons/:id', checkAuth, checkAdmin, async (req, res) => 
 
 
 // --- D. PUBLIC API (CHO APP MOBILE) ---
+
+
+
+// [U] User tự cập nhật thông tin cá nhân (Tên, Email, Avatar)
+app.put('/api/users/me', checkAuth, async (req, res) => {
+  try {
+    const uid = req.user.uid; // Lấy UID từ token (an toàn)
+    const { fullName, email, avatarUrl } = req.body;
+
+    // 1. Cập nhật Firestore
+    const updateData = {};
+    if (fullName) updateData.fullName = fullName;
+    if (email) updateData.email = email;
+    if (avatarUrl) updateData.avatarUrl = avatarUrl;
+    
+    await db.collection('users').doc(uid).update(updateData);
+
+    // 2. Cập nhật Firebase Auth (Để lần sau login hiện đúng tên/email)
+    const authUpdate = {};
+    if (fullName) authUpdate.displayName = fullName;
+    if (email) authUpdate.email = email;
+    // Lưu ý: photoURL của Auth có giới hạn độ dài, nếu avatarUrl là Base64 quá dài thì nên bỏ qua dòng dưới
+    if (avatarUrl && avatarUrl.length < 2000) authUpdate.photoURL = avatarUrl;
+
+    if (Object.keys(authUpdate).length > 0) {
+      await admin.auth().updateUser(uid, authUpdate);
+    }
+
+    res.json({ message: 'Cập nhật thông tin thành công' });
+  } catch (error) {
+    console.error("Lỗi cập nhật profile:", error);
+    res.status(500).send('Lỗi server: ' + error.message);
+  }
+});
+
+// [U] User tự đổi mật khẩu
+app.put('/api/users/me/password', checkAuth, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const { password } = req.body;
+
+    if (!password || password.length < 6) {
+      return res.status(400).send('Mật khẩu phải từ 6 ký tự trở lên');
+    }
+
+    await admin.auth().updateUser(uid, { password: password });
+    res.json({ message: 'Đổi mật khẩu thành công' });
+  } catch (error) {
+    console.error("Lỗi đổi mật khẩu:", error);
+    res.status(500).send('Lỗi server: ' + error.message);
+  }
+});
 
 // Tạo Profile khi đăng ký
 app.post('/api/users/create-profile', checkAuth, async (req, res) => {
