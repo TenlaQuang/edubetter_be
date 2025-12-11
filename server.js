@@ -19,7 +19,7 @@ const db = admin.firestore();
 
 // --- 2. CẤU HÌNH GEMINI AI (GOOGLE) ---
 // Quan trọng: Hãy đảm bảo bạn đã dán Key mới tạo vào đây
-const genAI = new GoogleGenerativeAI("AIzaSyDpDgjWuKLGc7cBUsyv9ne-r3A1Ur7XMsA"); 
+const genAI = new GoogleGenerativeAI("dán API Key của bạn vào đây"); 
 
 // Sử dụng model cơ bản để đảm bảo tương thích tối đa, không dùng config JSON mode gây lỗi
 const model = genAI.getGenerativeModel({ 
@@ -36,6 +36,28 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' })); 
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // ================= MIDDLEWARES =================
+
+
+// Middleware kiểm tra Auth nhưng KHÔNG bắt buộc (Dành cho trang chủ)
+const checkAuthOptional = async (req, res, next) => {
+  const idToken = req.header('Authorization')?.replace('Bearer ', '');
+  
+  // Nếu không có token -> Cho qua luôn (là Guest)
+  if (!idToken) {
+    req.user = null; 
+    return next();
+  }
+
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    req.user = decodedToken; 
+    next();
+  } catch (error) {
+    console.log('Token lỗi hoặc hết hạn, coi như là Guest');
+    req.user = null;
+    next();
+  }
+};
 
 // Xác thực người dùng (Kiểm tra Token)
 const checkAuth = async (req, res, next) => {
@@ -288,16 +310,13 @@ app.post('/api/users/create-profile', checkAuth, async (req, res) => {
   } catch (error) { res.status(500).send('Error'); }
 });
 
-// [R] Lấy danh sách Môn học (Kèm tiến độ học tập)
-app.get('/api/courses', checkAuth, async (req, res) => {
+// [R] Lấy danh sách Môn học (Public: Khách xem được, User xem được tiến độ)
+app.get('/api/courses', checkAuthOptional, async (req, res) => {
   try {
-    const userId = req.user.uid;
-
-    // 1. Lấy tất cả môn học
+    // 1. Lấy tất cả môn học (Ai cũng cần cái này)
     const subjectsSnapshot = await db.collection('subjects').get();
     
     // 2. Lấy tất cả bài học (để đếm tổng số bài mỗi môn)
-    // (Trong thực tế nếu nhiều dữ liệu nên dùng aggregation query hoặc lưu count vào subject)
     const lessonsSnapshot = await db.collection('lessons').get();
     const lessonCounts = {}; // Map: { subjectId: totalLessons }
     
@@ -307,19 +326,23 @@ app.get('/api/courses', checkAuth, async (req, res) => {
       lessonCounts[subId] = (lessonCounts[subId] || 0) + 1;
     });
 
-    // 3. Lấy tiến độ học của User (Bảng learning_progress)
-    // Giả sử bảng này lưu: { userId: "...", lessonId: "...", subjectId: "...", isCompleted: true }
-    const progressSnapshot = await db.collection('learning_progress')
-                                    .where('userId', '==', userId)
-                                    .where('isCompleted', '==', true)
-                                    .get();
-    
+    // 3. Lấy tiến độ học của User (CHỈ KHI ĐÃ ĐĂNG NHẬP)
     const userProgress = {}; // Map: { subjectId: completedCount }
-    progressSnapshot.forEach(doc => {
-      const data = doc.data();
-      const subId = data.subjectId;
-      userProgress[subId] = (userProgress[subId] || 0) + 1;
-    });
+    
+    // Kiểm tra: Nếu req.user tồn tại (đã đăng nhập) thì mới đi tìm tiến độ
+    if (req.user) {
+      const userId = req.user.uid;
+      const progressSnapshot = await db.collection('learning_progress')
+                                      .where('userId', '==', userId)
+                                      .where('isCompleted', '==', true)
+                                      .get();
+      
+      progressSnapshot.forEach(doc => {
+        const data = doc.data();
+        const subId = data.subjectId;
+        userProgress[subId] = (userProgress[subId] || 0) + 1;
+      });
+    }
 
     // 4. Gộp dữ liệu trả về
     const subjects = subjectsSnapshot.docs.map(doc => {
@@ -331,9 +354,9 @@ app.get('/api/courses', checkAuth, async (req, res) => {
         title: data.name, 
         description: data.description,
         thumbnailUrl: data.thumbnailUrl,
-        // Thêm 2 trường này
         totalLessons: lessonCounts[subjectId] || 0,
-        completedLessons: userProgress[subjectId] || 0
+        // Nếu là Khách (userProgress rỗng) thì completedLessons luôn là 0
+        completedLessons: userProgress[subjectId] || 0 
       };
     });
 
