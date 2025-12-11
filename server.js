@@ -391,7 +391,36 @@ app.post('/api/learning-progress', checkAuth, async (req, res) => {
   }
 });
 
+// API: Lấy danh sách tiến độ học tập của User theo môn học
+// App Flutter sẽ gọi cái này để biết tô xanh bài nào
+app.get('/api/learning-progress', async (req, res) => {
+  try {
+    const { userId, subjectId } = req.query;
 
+    if (!userId || !subjectId) {
+      return res.status(400).json({ error: 'Missing userId or subjectId' });
+    }
+
+    // Lấy tất cả các bài đã học của user này trong môn này
+    const snapshot = await db.collection('learning_progress')
+      .where('userId', '==', userId)
+      .where('subjectId', '==', subjectId)
+      .where('isCompleted', '==', true) // Chỉ lấy bài đã hoàn thành
+      .get();
+
+    // Trả về danh sách chỉ chứa lessonId (để App xử lý cho nhẹ)
+    const progressList = snapshot.docs.map(doc => ({
+      lessonId: doc.data().lessonId,
+      isCompleted: true
+    }));
+
+    res.json(progressList);
+
+  } catch (error) {
+    console.error('Error fetching progress:', error);
+    res.status(500).send('Error fetching progress');
+  }
+});
 
 // --- E. AI QUIZ LOGIC (NÂNG CẤP) ---
 
