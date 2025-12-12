@@ -19,7 +19,7 @@ const db = admin.firestore();
 
 // --- 2. CẤU HÌNH GEMINI AI (GOOGLE) ---
 // Quan trọng: Hãy đảm bảo bạn đã dán Key mới tạo vào đây
-const genAI = new GoogleGenerativeAI("dán API Key của bạn vào đây"); 
+const genAI = new GoogleGenerativeAI("AIzaSyAFJ7SFvSme5fnZCo-qF-HIB1m7kgkUtZ4"); 
 
 // Sử dụng model cơ bản để đảm bảo tương thích tối đa, không dùng config JSON mode gây lỗi
 const model = genAI.getGenerativeModel({ 
